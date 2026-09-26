@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/lib/common.sh"
+load_budgets "$ROOT"
+cmd="${1:-status}"
+shift || true
+
+intent_cmd() {
+  local text="${*:-}"
+  [[ -n "$text" ]] || { echo "usage: aegis intent <text>" >&2; exit 2; }
+  local raw hash
+  raw="$(now)"$'\n'"${text}"
+  hash="$(printf '%s' "$raw" | sha)"
+  printf '%s\n' "$raw" > "$ROOT/var/intent/${hash}.txt"
+  append_tsv "$ROOT" intent "$hash" created
+  echo "$hash"
+}
+
+draw_cmd() {
+  local ipath id dir n seed model body digest
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  dir="$ROOT/var/draft/${id}"
+  mkdir -p "$dir"
+  n="$(latest_n "$dir")"
+  n=${n:-0}
+  n=$((n+1))
+  if [[ "$n" -gt "${MAX_DRAFTS_PER_INTENT}" ]]; then
+    echo "budget: MAX_DRAFTS_PER_INTENT=${MAX_DRAFTS_PER_INTENT}" >&2
+    exit 3
+  fi
+  seed="$(printf '%s' "$id-$n-$(now)" | sha | cut -c1-16)"
+  model="${AEGIS_MODEL:-software:mouth}"
+  body=""
+  if [[ "${AEGIS_SAMPLER:-ollama}" == sim ]]; then
+    [[ -f "$ROOT/smith/sim/pbit_sim.py" ]] || { echo "sim missing" >&2; exit 2; }
+    body="$(python3 "$ROOT/smith/sim/pbit_sim.py" 16 "$id" 2>/dev/null || true)"
+    model="software:sim"
+  elif command -v ollama >/dev/null 2>&1; then
+    model="${AEGIS_MODEL:-llama3.2:1b}"
+    body="$(ollama run "$model" "Write exactly one reversible sentence that fulfills this intent. No preamble, no quotes around the whole answer, no explanation. Intent: $(tail -n +2 "$ipath")" 2>/dev/null || true)"
+  else
+    echo "draw: sampler unavailable" >&2
+    exit 2
+  fi
+  [[ -n "$body" ]] || { echo "draw: empty body" >&2; exit 2; }
+  printf '%s\n' "$body" > "$dir/${n}.txt"
+  digest="$(sha < "$dir/${n}.txt")"
+  cat > "$dir/${n}.receipt" << RCPT
+intent=${id}
+n=${n}
+seed=${seed}
+model=${model}
+draft_sha256=${digest}
+forge_class=none
+ts=$(now)
+RCPT
+  append_tsv "$ROOT" draw "$id" "n=${n}"
+  echo "${id}#${n}"
+}
+
+eval_cmd() {
+  local ipath id dir n draft sc bytes ok=1 reason=ok
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  dir="$ROOT/var/draft/${id}"
+  n="${1:-$(latest_n "$dir")}"
+  [[ -n "$n" && -f "$dir/${n}.txt" ]] || { echo "no draft" >&2; exit 2; }
+  draft="$dir/${n}.txt"
+  mkdir -p "$ROOT/var/eval/${id}"
+  sc="$ROOT/var/eval/${id}/${n}.score"
+  bytes="$(wc -c < "$draft" | tr -d ' ')"
+  if grep -Eiq 'seal\.py|run_seal|/root/SEAL|var/book' "$draft"; then
+    ok=0; reason=forbidden_path
+  fi
+  if [[ "$bytes" -gt "${MAX_DRAFT_BYTES}" ]]; then ok=0; reason=oversize; fi
+  if [[ "$ok" = 1 ]]; then
+    local hit=0 tok
+    while read -r tok; do
+      [[ -z "$tok" ]] && continue
+      echo "$tok" | grep -Eiq '^(draft|only|propose|one|reversible|sentence|about|does|mention)$' && continue
+      grep -Fiwq "$tok" "$draft" && hit=1 && break
+    done < <(intent_tokens "$ipath")
+    if [[ "$hit" != 1 ]]; then ok=0; reason=off_intent; fi
+  fi
+  cat > "$sc" << SC
+intent=${id}
+n=${n}
+ok=${ok}
+reason=${reason}
+bytes=${bytes}
+draft_sha256=$(sha < "$draft")
+ts=$(now)
+SC
+  append_tsv "$ROOT" eval "$id" "n=${n} ok=${ok} ${reason}"
+  echo "ok=${ok} reason=${reason} n=${n}"
+  [[ "$ok" = 1 ]]
+}
+
+read_cmd() {
+  local ipath id dir n
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  dir="$ROOT/var/draft/${id}"
+  n="${1:-$(latest_n "$dir")}"
+  [[ -n "$n" && -f "$dir/${n}.txt" ]] || { echo "no draft" >&2; exit 2; }
+  echo "=== draft $id#$n ==="
+  cat "$dir/${n}.txt"
+  echo "=== receipt ==="
+  cat "$dir/${n}.receipt"
+  [[ -f "$ROOT/var/eval/${id}/${n}.score" ]] && { echo "=== score ==="; cat "$ROOT/var/eval/${id}/${n}.score"; }
+}
+
+seal_cmd() {
+  local ipath id dir n draft sc
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  dir="$ROOT/var/draft/${id}"
+  n="${1:-$(latest_n "$dir")}"
+  draft="$dir/${n}.txt"
+  sc="$ROOT/var/eval/${id}/${n}.score"
+  [[ -f "$draft" ]] || { echo "no draft $n" >&2; exit 2; }
+  [[ -f "$sc" ]] || { echo "no scorecard for n=$n — run aegis eval $n" >&2; exit 2; }
+  grep -q '^ok=1$' "$sc" || { echo "eval failed for n=$n — refuse seal" >&2; exit 3; }
+  if [[ -f "$ROOT/var/out/${id}" ]]; then
+    echo "already sealed $(cat "$ROOT/var/out/${id}" | tr "\n" " ")" >&2
+    exit 3
+  fi
+  {
+    echo "# sealed ${id} n=${n} ts=$(now)"
+    cat "$draft"
+  } >> "$ROOT/var/book/book.txt"
+  cat > "$ROOT/var/out/${id}" << OUT
+intent=${id}
+n=${n}
+draft_sha256=$(sha < "$draft")
+score_sha256=$(sha < "$sc")
+forge_class=none
+sealer=keel
+ts=$(now)
+OUT
+  append_tsv "$ROOT" seal "$id" "n=${n}"
+  echo "sealed ${id}#${n}"
+}
+
+verify_cmd() {
+  local id n out draft sc d s od os
+  local ipath
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  out="$ROOT/var/out/${id}"
+  [[ -f "$out" ]] || { echo "no out receipt — not sealed" >&2; exit 2; }
+  n="${1:-$(awk -F= '/^n=/{print $2}' "$out")}"
+  draft="$ROOT/var/draft/${id}/${n}.txt"
+  sc="$ROOT/var/eval/${id}/${n}.score"
+  d="$(sha < "$draft")"
+  s="$(sha < "$sc")"
+  od="$(awk -F= '/^draft_sha256=/{print $2}' "$out")"
+  os="$(awk -F= '/^score_sha256=/{print $2}' "$out")"
+  if [[ "$d" == "$od" && "$s" == "$os" && "$(awk -F= '/^n=/{print $2}' "$out")" == "$n" ]]; then
+    echo "verify ok intent=$id n=$n"
+  else
+    echo "verify FAIL intent=$id n=$n" >&2
+    exit 3
+  fi
+}
+
+
+list_cmd() {
+  local ipath id dir
+  ipath="$(latest_intent "$ROOT")"
+  [[ -n "$ipath" ]] || { echo "no intent" >&2; exit 2; }
+  id="$(intent_id_from_path "$ipath")"
+  dir="$ROOT/var/draft/${id}"
+  echo "intent=$id"
+  shopt -s nullglob
+  local f n
+  for f in "$dir"/*.txt; do
+    n="$(basename "$f" .txt)"
+    local ev="none"
+    [[ -f "$ROOT/var/eval/${id}/${n}.score" ]] && ev="$(awk -F= '/^ok=/{print $2}' "$ROOT/var/eval/${id}/${n}.score")/$(awk -F= '/^reason=/{print $2}' "$ROOT/var/eval/${id}/${n}.score")"
+    echo "n=$n eval=$ev bytes=$(wc -c < "$f" | tr -d ' ')"
+  done
+  shopt -u nullglob
+}
+
+status_cmd() {
+  echo "root=$ROOT"
+  grep -E '^(plane|forge_class)=' "$ROOT/var/book/book.txt" | tail -2 || true
+  local li
+  li="$(latest_intent "$ROOT")"
+  if [[ -n "$li" ]]; then echo "latest_intent=$(basename "$li" .txt)"; else echo "latest_intent=none"; fi
+  echo -n "last_event="; tail -1 "$ROOT/var/book/state.tsv" 2>/dev/null || echo none
+}
+
+case "$cmd" in
+  intent) intent_cmd "$@" ;;
+  draw)   draw_cmd "$@" ;;
+  eval)   eval_cmd "$@" ;;
+  read)   read_cmd "$@" ;;
+  seal)   seal_cmd "$@" ;;
+  verify) verify_cmd "$@" ;;
+  list) list_cmd "$@" ;;
+  status) status_cmd "$@" ;;
+  *) echo "usage: aegis intent|draw|eval|read|list|seal|verify|status  [n]" >&2; exit 2 ;;
+esac

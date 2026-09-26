@@ -1,0 +1,4 @@
+etc/SEAL
+var/
+*.pyc
+__pycache__/
